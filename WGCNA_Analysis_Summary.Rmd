@@ -1,0 +1,998 @@
+---
+title: "Sickle Cell Disease - Weighted Gene Co-Expression Network Analysis (WGCNA)"
+author: Yann Ilboudo, Melanie Garrett, Allison Ashley-Koch, Marilyn Telen, Guillaume
+  Lettre
+date: "April 25th 2018"
+output:
+  html_document:
+    code_folding: show
+    number_sections: yes
+    theme: "flatly"
+    toc: yes
+    toc_float: yes
+    highlight: "default"
+  pdf_document:
+    toc: yes
+  html:notebook:
+    df_print: paged
+    number_sections: yes
+    toc: yes
+    toc_float: yes
+---
+
+```{r setup, echo = FALSE, message = FALSE, warning = FALSE}
+knitr::opts_chunk$set(dev = c("png", "pdf"), # Display PNG but also keep PDF
+                      fig.keep = "all",
+                      fig.path = "plots/",
+                      cache = TRUE,
+                      cache.path = "cache/")
+```
+
+# Abstract
+
+This markdown document is meant to illustrate all the results presented in Ilboudo., et al (2018), all the preprocessing done on the data and the generation of tables as well as figures. The document is interactive and can be be easily navigated moving from one section to another.
+
+**Background:**
+Sickle cell disease (SCD) is a monogenic disease caused by mutations in the β-globin gene. The complications related to the disease are systemic as they impact multiple organ systems. Our goal in this study was to identify metabolome changes contributing to SCD-related severity. 
+
+Employing both targeted and untargeted approaches, we profiled the plasma of 706 SCD patients using liquid chromatography tandem mass spectrometry. The cohort included 406 French patients of recent African descent and 300 African Americans from the southeastern US. In total, we measured the levels of 61 known and 2,100 unknown metabolites. We applied weighted gene correlation network analysis (WGCNA) algorithms to account for correlations among metabolites and identify specific metabolomic modules associated with SCD-related complications
+
+Several chuncks of code for this analysis are adapted from [**WGCNA tutorial**](https://labs.genetics.ucla.edu/horvath/CoexpressionNetwork/Rpackages/WGCNA/Tutorials/index.html).
+
+
+# Set up
+Load or install libraries necessary to perform analysis
+```{r,eval=FALSE}
+source("http://bioconductor.org/biocLite.R")
+biocLite(c("AnnotationDbi", "impute", "GO.db", "preprocessCore","WGCNA"))
+install.packages(pkgs=c("WGCNA", "flashClust", "ggplot2",
+"limma","factoextra","devtools","Biobase","sva","dplyr","magrittr"))
+devtools::install_github("yilboudo/myUtils")
+```
+
+## Load the libraries and custom scripts
+```{r, eval=FALSE}
+rm(list=ls())
+options(stringsAsFactors = F)
+library(myUtils)
+library(limma)
+library(WGCNA)
+library(factoextra)
+library(devtools)
+library(Biobase)
+library(sva)
+library(dplyr)
+library(gdata)
+library(data.table)
+```
+## Load actual datasets
+```{r, eval=FALSE}
+allsamples_new <- read.table("GENMOD_OMG_metabolites_no_batch_correction.txt",sep="\t",h=T)
+batches <- read.table("GENMOD_OMG_batch_information.txt",sep="\t",h=T)
+```
+## Align datasets such that metabolites file and batch information are in the same order
+```{r, eval=FALSE}
+#Load dplyr
+slice <- dplyr::slice
+#align data in the right order
+x <- rownames(allsamples_new)
+batches <- batches %>% slice(match(x, CLIENT_IDS))
+batches <- as.data.frame(batches)
+```
+## Display cohorts by batches
+```{r, eval=FALSE}
+#image_name1 = 'all_cohorts_batches_pre_correction.pdf'
+#pdf(file = image_name1, width = 10, height = 10)
+res.pca_uncorrected <- prcomp(allsamples_new, scale = T)
+fviz_pca_ind(res.pca_uncorrected, label="none", habillage=batches$Batches,
+             addEllipses=F, ellipse.level=0.95, palette = "igv") #+ xlim(-50,70) + ylim(-50,50)
+#dev.off()
+```
+<img src="https://github.com/yilboudo/WGCNA_SCD/blob/master/plots/all_cohorts_batches_pre_correction-1.png?raw=true" alt="Drawing" style="width: 900px;"/>
+
+
+## Apply batch effect correction with ComBat
+```{r, eval=FALSE}
+allsamples_new_combat <- run_combat(allsamples_new, batches, 2)
+res.pca_corrected <- prcomp(allsamples_new_combat, scale = TRUE)
+
+#save resulting output
+allsamples_new_combat$CLIENT_IDs <- batches$CLIENT_IDS
+write.table(allsamples_new_combat, file = "GENMOD_OMG_metabolites_with_batch_correction.txt", 
+            quote = FALSE, row.names = FALSE, col.names = TRUE,sep="\t")
+
+```
+## Display cohorts after batch effect correction
+```{r, eval=FALSE} 
+image_name2 = 'all_cohorts_batches_post_correction.pdf'
+pdf(file = image_name2, width = 10, height = 10)
+fviz_pca_ind(res.pca_corrected, label = "none", habillage=batches$Batches,
+             addEllipses=F,  ellipse.level=0.95, palette = "igv") + xlim(-65,40) + ylim(-65,65)
+dev.off()
+```
+<img src="https://github.com/yilboudo/WGCNA_SCD/blob/master/plots/all_cohorts_batches_post_correction-1.png?raw=true" alt="Drawing" style="width: 900px;"/>
+
+# Running weighted co-expression analysis
+```{r,eval=FALSE}
+#Load dataset
+#Metabolites
+allsamples_new_combat <- read.table("GENMOD_OMG_metabolites_with_batch_correction.txt",sep="\t",h=T,stringsAsFactors = F)
+#Phenotypes
+large_data_genmod_duke_n705 <-read.table("genmod_duke_phenotypes_n705_final.txt",sep="\t",h=T,stringsAsFactors = F)
+
+#Clean metabolite data
+rownames(allsamples_new_combat) <- allsamples_new_combat$CLIENT_IDs
+allsamples_new_combat <- allsamples_new_combat[,-c(which(names(allsamples_new_combat)=="CLIENT_IDs"))]
+
+#Apply Cyclic Loess Normalization
+allsamples_new_combat_norm <- normalizeCyclicLoess(allsamples_new_combat, weights = NULL, span=0.7, iterations = 3, method = "fast")
+allsamples_new_combat_norm_cl <- as.data.frame(allsamples_new_combat_norm)
+
+#Apply clustering
+sampleTree = hclust(dist(allsamples_new_combat_norm_cl), method = "average")
+```
+## Step 1. Display sample dendogram - looking for outliers
+```{r, eval=FALSE}
+sizeGrWindow(12,9)
+#pdf(file = "allsamples_Clustering.pdf", width = 12, height = 9)
+#par(cex = 0.6);
+#par(mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex.lab = 1.5,
+     cex.axis = 1.5, cex.main = 2)
+abline(h = 52, col = "red")
+#dev.off()
+```
+<img src="https://github.com/yilboudo/WGCNA_SCD/blob/master/plots/allsamples_Clustering.png?raw=true" alt="Drawing" style="width: 900px;"/>
+
+*Re-cluster samples and remove outliers from dataset*
+```{r,eval=FALSE}
+# Determine cluster under the line
+clust = cutreeStatic(sampleTree, cutHeight = 52, minSize = 10)
+
+keepSamples = (clust==1)
+allsamples_norm_cl_trimmed = allsamples_new_combat_norm_cl[keepSamples, ]
+nMetabo = ncol(allsamples_norm_cl_trimmed)
+nSamples = nrow(allsamples_norm_cl_trimmed)
+```
+
+*Remove outliers from phenotype dataset*
+```{r,eval=FALSE}
+allTraits = large_data_genmod_duke_n705;
+datTraits <- allTraits[match(rownames(allsamples_norm_cl_trimmed), rownames(allTraits)),]
+#dim(datTraits)
+collectGarbage();
+```
+
+*Cluster samples showing phenotype information on blood traits and complications*
+```{r,eval=FALSE}
+sampleTree2 = hclust(dist(allsamples_norm_cl_trimmed), method = "average")
+
+#Convert traits to a color representation: white means low, red means high, grey means missing entry
+blood_traitColors = numbers2colors(datTraits[,c(which(names(datTraits)=="eGFR"),which(names(datTraits)=="Hematocrit"),
+             which(names(datTraits)=="HemoglobinF"),which(names(datTraits)=="MCH"),
+             which(names(datTraits)=="MCV"),which(names(datTraits)=="Platelets"),
+             which(names(datTraits)=="RBC"),which(names(datTraits)=="Reticulocyte"),
+             which(names(datTraits)=="Whitebloodcount"),which(names(datTraits)=="Bilirubin"),
+             which(names(datTraits)=="LDH"))],signed=T)
+
+#blood_traitColors =  suppressWarnings(numbers2colors(datTraits[,c(69,27,24)],signed=T))
+
+
+
+# Convert traits to a color representation: white means low, red means high, grey means missing entry
+complications_traitColors = numbers2colors(datTraits[,c(which(names(datTraits)=="Legulcer"),which(names(datTraits)=="Cholecystectomy"), which(names(datTraits)=="AscepticNecrosis"),which(names(datTraits)=="Priapism"),
+             which(names(datTraits)=="Retinopathy"),which(names(datTraits)=="Survival"))],signed=T)
+
+```
+
+*Display graphics for blood traits and for complications*
+```{r, eval=FALSE}
+#pdf(file = "allsamples_with_bloodtraits_clustering2.pdf", width = 20, height = 15);
+plotDendroAndColors(sampleTree2, blood_traitColors,
+                    groupLabels = names(datTraits[,c(which(names(datTraits)=="eGFR"),which(names(datTraits)=="Hematocrit"),       
+                                                     which(names(datTraits)=="HemoglobinF"),which(names(datTraits)=="MCH"),
+                                                     which(names(datTraits)=="MCV"),which(names(datTraits)=="Platelets"),
+                                                     which(names(datTraits)=="RBC"),which(names(datTraits)=="Reticulocyte"),
+                                                     which(names(datTraits)=="Whitebloodcount"),which(names(datTraits)=="Bilirubin"),
+                                                     which(names(datTraits)=="LDH"))]), main = "Sample dendrogram and trait heatmap")
+#dev.off()
+
+#pdf(file = "allsamples_with_complication_traits_clustering.pdf", width = 20, height = 15);
+plotDendroAndColors(sampleTree2, complications_traitColors,
+                    groupLabels = names(datTraits[,c(which(names(datTraits)=="Legulcer"),
+                    which(names(datTraits)=="Cholecystectomy"),
+                    which(names(datTraits)=="AscepticNecrosis"),which(names(datTraits)=="Priapism"),
+                    which(names(datTraits)=="Retinopathy"),which(names(datTraits)=="Survival"))]),
+                    main = "Sample dendrogram and trait heatmap")
+#dev.off()
+```
+<img src="https://github.com/yilboudo/WGCNA_SCD/blob/master/plots/allsamples_with_bloodtraits_clustering.png?raw=true" alt="Drawing" style="width: 900px;"/>
+
+<img src="https://github.com/yilboudo/WGCNA_SCD/blob/master/plots/allsamples_with_complication_traits_clustering.png?raw=true" alt="Drawing" style="width: 900px;"/>
+
+*Save resulting data frames*
+```{r,eval=FALSE}
+save(allsamples_norm_cl_trimmed, datTraits, file = "allsamples-01-dataInput.RData")
+```
+## Step 2. Determine levels of connectivity at different powers
+```{r,eval=FALSE}
+powers = c(c(1:10), seq(from = 12, to=20, by=2))
+sft = pickSoftThreshold(allsamples_norm_cl_trimmed,corFnc = cor, networkType = 'signed',powerVector = powers, verbose = 5)
+```
+*Choosing the soft-thresholding power: analysis of network topology*
+```{r, eval=FALSE}
+#pdf(file = "allsamples_power.pdf", width = 12, height = 9)
+par(mfrow = c(1,2));
+cex1 = 0.8;
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",type="n",
+     main = paste("Scale independence"));
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     labels=powers,cex=cex1,col="red");
+# this line corresponds to using an R^2 cut-off of h
+abline(h=0.80,col="red")
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+     xlab="Soft Threshold (power)",ylab="Mean Connectivity", type="n",
+     main = paste("Mean connectivity"))
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=cex1,col="red")
+#dev.off()
+```
+<img src="https://github.com/yilboudo/WGCNA_SCD/blob/master/plots/allsamples_power.png?raw=true" alt="Drawing" style="width: 900px;"/>
+
+## Step 3. Module Construction and Identification
+```{r,eval=FALSE}
+#Co-expression similarity and adjacency
+softPower = 6;
+adjacency = adjacency(allsamples_norm_cl_trimmed, power = softPower);
+#Topological Overlap Matrix (TOM)
+TOM = TOMsimilarity(adjacency);
+dissTOM = 1-TOM
+#Clustering using TOM
+geneTree = hclust(as.dist(dissTOM), method = "average");
+```
+
+```{r,eval=FALSE}
+# Plot the resulting clustering tree (dendrogram)
+pdf(file = "allsamples_metabo_networks.pdf", width = 12, height = 9)
+plot(geneTree, xlab="", sub="", main = "Metabolite clustering on TOM-based dissimilarity",
+    labels = FALSE, hang = 0.04);
+dev.off()
+
+```
+
+*Module identification using dynamic tree cut*
+```{r,eval=FALSE}
+minModuleSize = 7;
+# Module identification using dynamic tree cut:
+dynamicMods = cutreeDynamic(dendro = geneTree, distM = dissTOM,
+                            deepSplit = 2, pamRespectsDendro = FALSE,
+                            minClusterSize = minModuleSize);
+table(dynamicMods)
+# Convert numeric lables into colors
+dynamicColors = labels2colors(dynamicMods)
+table(dynamicColors)
+```
+*Plot Dendogram with colors underneath*
+```{r,eval=FALSE}
+# Plot the dendrogram and colors underneath
+sizeGrWindow(8,6)
+pdf(file = "allsamples_metabo_networks_color.pdf", width = 12, height = 9)
+plotDendroAndColors(geneTree, dynamicColors, "Dynamic Tree Cut",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05,
+                    main = "Metabolite dendrogram and module colors")
+
+dev.off()
+```
+<img src="https://github.com/yilboudo/WGCNA_SCD/blob/master/plots/allsamples_metabo_networks_color.png?raw=true" alt="Drawing" style="width: 900px;"/>
+
+##Step 4. Calculate the module eigengenes and combine closely related modules
+```{r, eval=FALSE}
+# Calculate eigengenes
+MEList = moduleEigengenes(allsamples_norm_cl_trimmed, colors = dynamicColors)
+MEs = MEList$eigengenes
+# Calculate dissimilarity of module eigengenes
+MEDiss = 1-cor(MEs);
+# Cluster module eigengenes
+METree = hclust(as.dist(MEDiss), method = "average");
+# Select threshold for merging modules together
+MEDissThres = 0.25
+# Plot the cut line into the dendrogram
+#abline(h=MEDissThres, col = "red")
+# Call an automatic merging function
+merge = mergeCloseModules(allsamples_norm_cl_trimmed, dynamicColors, cutHeight = MEDissThres, verbose = 3)
+# The merged module colors
+mergedColors = merge$colors;
+# Eigengenes of the new merged modules:
+mergedMEs = merge$newMEs;
+```
+*Display new modules*
+```{r,eval=F}
+#pdf(file = "allsamples_metabo_dendo.pdf", width = 12, height = 9)
+plotDendroAndColors(geneTree, cbind(dynamicColors, mergedColors),
+                    c("Dynamic Tree Cut", "Merged dynamic"),
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+#dev.off()
+```
+<img src="https://github.com/yilboudo/WGCNA_SCD/blob/master/plots/allsamples_metabo_dendo.png?raw=true" alt="Drawing" style="width: 900px;"/>
+
+*Rename module colors and save results*
+```{r,eval=FALSE}
+# Rename to moduleColors
+moduleColors = mergedColors
+# Construct numerical labels corresponding to the colors
+colorOrder = c("grey", standardColors(50));
+moduleLabels = match(moduleColors, colorOrder)-1;
+MEs = mergedMEs;
+# Save module colors and labels for use in subsequent parts
+save(MEs, moduleLabels, moduleColors, geneTree, file = "allsamples-02-networkConstruction-stepByStep.RData")
+```
+## Step 5.Remove modules with poor preservation scores, and re-draw topological overlap map (TOM) and eigengenes
+```{r, eval=FALSE}
+lnames3 = load(file = "~/Desktop/Metabolite_All_Data_dec52017/module_preservation_stats.RData")
+preserved_modules <- preservations_stats_all_df[preservations_stats_all_df$V2 > 10,]
+restGenes= (moduleColors %in% preserved_modules$V1) & !(moduleColors %in% "grey") & !(moduleColors %in% "gold")
+SubGeneNames <- colnames(allsamples_norm_cl_trimmed)
+dissTOM = 1-TOMsimilarityFromExpr(allsamples_norm_cl_trimmed[,restGenes], power = 6);
+
+# Transform dissTOM with a power to make moderately strong connections more visible in the heatmap
+plotTOM = dissTOM^10;
+
+colnames(dissTOM) =rownames(dissTOM) =SubGeneNames[restGenes]
+hier1=hclust(as.dist(dissTOM), method="average" )
+
+# Set diagonal to NA for a nicer plot
+diag(plotTOM) = NA;
+# Call the plot function
+#sizeGrWindow(9,9)
+#pdf(file = "all_samples_network_plot2.pdf", width = 10, height = 10)
+TOMplot(plotTOM, hier1, moduleColors[restGenes], main = "Network heatmap plot, all genes")
+#dev.off()
+
+MEList = moduleEigengenes(allsamples_norm_cl_trimmed[,restGenes], colors = moduleColors[restGenes])
+MEs = MEList$eigengenes
+MET=orderMEs(MEs)
+#pdf(file = "all_samples_eigengenes_plot2.pdf", width = 10, height = 10)
+plotEigengeneNetworks(MET, "", marDendro = c(0,4,1,2), marHeatmap = c(3,4,1,2))
+#dev.off()
+```
+<img src="https://github.com/yilboudo/WGCNA_SCD/blob/master/plots/all_samples_network_plot2.png?raw=true" alt="Drawing" style="width: 900px;"/>
+<img src="https://github.com/yilboudo/WGCNA_SCD/blob/master/plots/all_samples_eigengenes_plot2.png?raw=true" alt="Drawing" style="width: 900px;"/>
+
+# Relate module to external traits
+## Relate eigen genes to blood traits and complications
+```{r,eval=FALSE}
+lnames1 = load(file = "allsamples-01-dataInput.RData");
+#The variable lnames contains the names of loaded variables.
+lnames1
+# Load network data saved in the second part.
+lnames2 = load(file = "allsamples-02-networkConstruction-stepByStep.RData");
+datTraits_for_assoc <- datTraits
+# Define numbers of metabolites and samples
+nGenes = ncol(allsamples_norm_cl_trimmed);
+nSamples = nrow(allsamples_norm_cl_trimmed);
+# Recalculate MEs with color labels
+MEs0 = moduleEigengenes(allsamples_norm_cl_trimmed, moduleColors)$eigengenes
+MEs = orderMEs(MEs0)
+rownames(MEs) <- rownames(allsamples_norm_cl_trimmed)
+
+#inverse normal transform eigengenes
+MEs_for_assoc <- as.data.frame(apply(MEs,2,invnorm))
+
+#Define variable for blood traits, and covariates
+blood_traits1 = "eGFR"
+cov_names1="SCD_geno,HU"
+
+blood_traits = c("Hematocrit","HemoglobinF","MCH","MCV","MCHC","Platelets","RBC","Reticulocyte","Whitebloodcount", "Bilirubin", "LDH")
+cov_names="SCD_geno,HU,Age,Sex"
+
+#Create matrices to store summary statistics values
+blood_traits_associations_pval <- matrix(NA,dim(MEs)[2],length(blood_traits))
+blood_traits_associations_effect <- matrix(NA,dim(MEs)[2],length(blood_traits))
+blood_traits_associations_n <- matrix(NA,dim(MEs)[2],length(blood_traits))
+
+blood_traits_associations_pval1 <- matrix(NA,dim(MEs)[2],length(blood_traits1))
+blood_traits_associations_effect1 <- matrix(NA,dim(MEs)[2],length(blood_traits1))
+blood_traits_associations_n1 <- matrix(NA,dim(MEs)[2],length(blood_traits1))
+
+#Run association for most traits except eGFR because covariates are not the same
+for (i in 1:length(blood_traits)) { 
+
+  datTraits_trait <- datTraits_for_assoc[complete.cases(datTraits_for_assoc[,which(colnames(datTraits_for_assoc)==blood_traits[i])]),]
+  keeping_indiv <- rownames(datTraits_trait)
+  datTraits_trait$Zpheno <- invnorm(datTraits_trait[,which(names(datTraits_trait)==blood_traits[i])])
+  MEsTrait <- MEs_for_assoc[(rownames(MEs_for_assoc) %in% keeping_indiv),]
+
+  covariates <- strsplit(cov_names, split=",")[[1]]
+  cov=datTraits_trait[,covariates]
+
+  observed_pval <- sapply(MEsTrait, linearRegcov_p, y=datTraits_trait$Zpheno, data=cov)
+  std_err <- sapply(MEsTrait, linearRegcov_stderr, y=datTraits_trait$Zpheno, data=cov)
+  effect_size <- sapply(MEsTrait, linearRegcov_effect, y=datTraits_trait$Zpheno, data=cov)
+  sample_size <- sapply(MEsTrait, linearRegcov_samplesize, y=datTraits_trait$Zpheno, data=cov)
+
+
+  blood_traits_associations_pval[,i] <- observed_pval
+  blood_traits_associations_effect[,i] <- effect_size
+  blood_traits_associations_n[,i] <- sample_size
+}
+
+#Run association for eGFR
+for (i in 1:length(blood_traits1)) { 
+
+  datTraits_trait <- datTraits_for_assoc[complete.cases(datTraits_for_assoc[,which(colnames(datTraits_for_assoc)==blood_traits1[i])]),]
+  keeping_indiv <- rownames(datTraits_trait)
+  datTraits_trait$Zpheno <- invnorm(datTraits_trait[,which(names(datTraits_trait)==blood_traits1[i])])
+  MEsTrait <- MEs_for_assoc[(rownames(MEs_for_assoc) %in% keeping_indiv),]
+
+  covariates <- strsplit(cov_names1, split=",")[[1]]
+  cov=datTraits_trait[,covariates]
+
+  observed_pval <- sapply(MEsTrait, linearRegcov_p, y=datTraits_trait$Zpheno, data=cov)
+  std_err <- sapply(MEsTrait, linearRegcov_stderr, y=datTraits_trait$Zpheno, data=cov)
+  effect_size <- sapply(MEsTrait, linearRegcov_effect, y=datTraits_trait$Zpheno, data=cov)
+  sample_size <- sapply(MEsTrait, linearRegcov_samplesize, y=datTraits_trait$Zpheno, data=cov)
+
+
+  blood_traits_associations_pval1[,i] <- observed_pval
+  blood_traits_associations_effect1[,i] <- effect_size
+  blood_traits_associations_n1[,i] <- sample_size
+}
+
+
+blood_traits_associations_pval <- cbind(blood_traits_associations_pval, blood_traits_associations_pval1)
+blood_traits_associations_effect <- cbind(blood_traits_associations_effect, blood_traits_associations_effect1)
+blood_traits_associations_n <- cbind(blood_traits_associations_n, blood_traits_associations_n1)
+
+blood_traits_associations <- as.data.frame(blood_traits_associations_pval)
+names(blood_traits_associations) <- c(blood_traits , "eGFR")
+rownames(blood_traits_associations) <- names(MEs)
+
+blood_traits_associations_cor <- as.data.frame(blood_traits_associations_effect)
+names(blood_traits_associations_cor) <- c(blood_traits , "eGFR")
+rownames(blood_traits_associations_cor) <- names(MEs)
+
+
+#Associations with complications
+complications = c("Legulcer","Cholecystectomy","AscepticNecrosis","Priapism", "Retinopathy","Survival")
+
+complications_associations_pval <- matrix(NA,dim(MEs)[2],length(complications))
+complications_associations_effect <- matrix(NA,dim(MEs)[2],length(complications))
+complications_associations_n <- matrix(NA,dim(MEs)[2],length(complications))
+
+for (i in 1:length(complications)) {
+
+  datTraits_trait <- datTraits_for_assoc[complete.cases(datTraits_for_assoc[,which(colnames(datTraits_for_assoc)==complications[i])]),]
+  keeping_indiv <- rownames(datTraits_trait)
+  datTraits_trait$Zpheno <- datTraits_trait[,which(names(datTraits_trait)==complications[i])]
+  MEsTrait <- MEs_for_assoc[(rownames(MEs_for_assoc) %in% keeping_indiv),]
+
+  covariates <- strsplit(cov_names, split=",")[[1]]
+  cov=datTraits_trait[,covariates]
+
+  observed_pval <- sapply(MEsTrait, logisticRegcov_p, y=datTraits_trait$Zpheno, data=cov)
+  effect_size <- sapply(MEsTrait, logisticRegcov_effect, y=datTraits_trait$Zpheno, data=cov)
+  sample_size <- sapply(MEsTrait, logisticRegcov_samplesize, y=datTraits_trait$Zpheno, data=cov)
+
+  complications_associations_pval[,i] <- observed_pval
+  complications_associations_effect[,i] <- effect_size
+  complications_associations_n[,i] <- sample_size
+}
+
+complications_associations <- as.data.frame(complications_associations_pval)
+names(complications_associations) <- complications
+rownames(complications_associations) <- names(MEs)
+
+complications_associations_cor <- as.data.frame(complications_associations_effect)
+names(complications_associations_cor) <- complications
+rownames(complications_associations_cor) <- names(MEs)
+
+pvals <- cbind(complications_associations,blood_traits_associations)
+cor <- cbind(complications_associations_cor,blood_traits_associations_cor)
+```
+
+*Display associations statistics of modules and blood traits and complications in a heatmap*
+```{r, eval=F}
+png(file="allsamples_metabo_traits_assoc_blood_final.png", units = "px",width=9000, height=9000, res=350, pointsize=15)
+# Will display correlations and their p-values
+textMatrix = paste(signif(as.matrix(pvals), 2), "\n(",
+                   signif(as.matrix(cor), 1), ")", sep = "");
+dim(textMatrix) = dim(cor)
+par(mar = c(7, 8.5, 2, 3));
+# Display the correlation values within a heatmap plot
+labeledHeatmap(Matrix = cor[,which(names(pvals)=="Hematocrit"):which(names(pvals)=="eGFR")], 
+               xLabels = names(pvals)[which(names(pvals)=="Hematocrit"):which(names(pvals)=="eGFR")],
+               yLabels = names(MEs),
+               ySymbols = names(MEs),
+               colorLabels = F,
+               colors = blueWhiteRed(50),
+               textMatrix = textMatrix[,which(names(pvals)=="Hematocrit"):which(names(pvals)=="eGFR")],
+               setStdMargins = F,
+               cex.text = 0.7,
+               zlim = c(-0.60, 0.40),
+               main = paste("Module-trait relationships"))
+dev.off()
+```
+<img src="https://github.com/yilboudo/WGCNA_SCD/blob/master/plots/allsamples_metabo_traits_assoc_blood_final.png?raw=true" alt="Drawing" style="width: 900px;"/>
+
+```{r,eval=F}
+png(file="allsamples_metabo_traits_assoc_complications_final.png", units = "px",width=9000, height=9000, res=350, pointsize=15)
+# Will display correlations and their p-values
+textMatrix = paste(signif(as.matrix(pvals), 2), "\n(",
+                   signif(as.matrix(cor), 1), ")", sep = "");
+dim(textMatrix) = dim(cor)
+par(mar = c(7, 8.5, 2, 3));
+# Display the correlation values within a heatmap plot
+labeledHeatmap(Matrix = cor[,which(names(pvals)=="Legulcer"):which(names(pvals)=="Survival")], #moduleTraitCor[,-c(1,15:19)],
+               xLabels = names(pvals)[which(names(pvals)=="Legulcer"):which(names(pvals)=="Survival")],
+               yLabels = names(MEs),
+               ySymbols = names(MEs),
+               colorLabels = F,
+               colors = blueWhiteRed(50),
+               textMatrix = textMatrix[,which(names(pvals)=="Legulcer"):which(names(pvals)=="Survival")],
+               setStdMargins = F,
+               cex.text = 0.7,
+               zlim = c(0,2),
+               main = paste("Module-trait relationships"))
+dev.off()
+
+```
+<img src="https://github.com/yilboudo/WGCNA_SCD/blob/master/plots/allsamples_metabo_traits_assoc_complications_final.png?raw=true" alt="Drawing" style="width: 900px;"/>
+
+*Find top module per trait*
+```{r,eval= FALSE}
+#Top module with strong traits associations
+topmodule <- rownames(pvals[pvals$Legulcer< (0.05/(66*15)),])
+topmodule <- append(topmodule,rownames(pvals[pvals$Cholecystectomy< (0.05/(66*15)),]))
+topmodule <- append(topmodule,rownames(pvals[pvals$AscepticNecrosis< (0.05/(66*15)),]))
+topmodule <- append(topmodule,rownames(pvals[pvals$Priapism< (0.05/(66*15)),]))
+topmodule <- append(topmodule,rownames(pvals[pvals$Retinopathy< (0.05/(66*15)),]))
+topmodule <- append(topmodule,rownames(pvals[pvals$Hematocrit< (0.05/(66*15)),]))
+topmodule <- append(topmodule,rownames(pvals[pvals$HemoglobinF< (0.05/(66*15)),]))
+topmodule <- append(topmodule,rownames(pvals[pvals$MCH< (0.05/(66*15)),]))
+topmodule <- append(topmodule,rownames(pvals[pvals$MCV< (0.05/(66*15)),]))
+topmodule <- append(topmodule,rownames(pvals[pvals$Platelets< (0.05/(66*15)),]))
+topmodule <- append(topmodule,rownames(pvals[pvals$RBC< (0.05/(66*15)),]))
+topmodule <- append(topmodule,rownames(pvals[pvals$Reticulocyte< (0.05/(66*15)),]))
+topmodule <- append(topmodule,rownames(pvals[pvals$Whitebloodcount< (0.05/(66*15)),]))
+topmodule <- append(topmodule,rownames(pvals[pvals$Survival< (0.05/(66*15)),]))
+topmodule <- append(topmodule,rownames(pvals[pvals$eGFR< (0.05/(66*15)),]))
+
+table(topmodule)
+```
+## Relate individual metabolites to traits and to modules
+```{r,eval= FALSE}
+modNames = substring(names(MEs), 3)
+eigens <- names(MEs)
+
+dim(datTraits)
+
+#Metabolites to module eigenvalues
+metabo_modulemembership_cor = matrix(NA,length(1:length(allsamples_norm_cl_trimmed)),dim(MEs_for_assoc)[2])
+metabo_modulemembership_pval = matrix(NA,length(1:length(allsamples_norm_cl_trimmed)),dim(MEs_for_assoc)[2])
+#
+datTraits_trait <- datTraits_for_assoc[complete.cases(datTraits_for_assoc[,which(colnames(datTraits_for_assoc)=="Sex")]),]
+#
+covariates <- strsplit(cov_names, split=",")[[1]]
+cov=datTraits_trait[,covariates]
+#
+for (i in 1:length(eigens)) {
+  observed_pval <- sapply(allsamples_norm_cl_trimmed, linearRegcov_p, y=MEs_for_assoc[,eigens[i]], data=cov)
+  effect_size <- sapply(allsamples_norm_cl_trimmed, linearRegcov_effect, y=MEs_for_assoc[,eigens[i]], data=cov)
+
+  metabo_modulemembership_pval[,i] <- observed_pval
+  metabo_modulemembership_cor[,i] <- effect_size
+}
+
+metabo_modulemembership_pval_final <- as.data.frame(metabo_modulemembership_pval)
+names(metabo_modulemembership_pval_final) <- paste(names(MEs_for_assoc),".pval",sep="")
+rownames(metabo_modulemembership_pval_final) <- colnames(allsamples_norm_cl_trimmed)
+
+metabo_modulemembership_cor_final <- as.data.frame(metabo_modulemembership_cor)
+names(metabo_modulemembership_cor_final) <- paste(names(MEs_for_assoc),".beta",sep="")
+rownames(metabo_modulemembership_cor_final) <- colnames(allsamples_norm_cl_trimmed)
+
+geneModuleMembership=metabo_modulemembership_cor_final
+MMPvalue = metabo_modulemembership_pval_final
+
+save(eigens,modNames,metabo_modulemembership_cor, metabo_modulemembership_pval, 
+     metabo_modulemembership_pval_final,metabo_modulemembership_cor_final,
+     file = "Module_Memberships_Associations.RData")
+load("Module_Memberships_Associations.RData")
+
+
+#Metabolites to traits
+metabo_bloodtrait_cor = matrix(NA,length(1:length(allsamples_norm_cl_trimmed)), length(blood_traits))
+metabo_bloodtrait_pval = matrix(NA,length(1:length(allsamples_norm_cl_trimmed)), length(blood_traits))
+metabo_bloodtrait_n = matrix(NA,length(1:length(allsamples_norm_cl_trimmed)), length(blood_traits))
+
+metabo_bloodtrait_cor1 = matrix(NA,length(1:length(allsamples_norm_cl_trimmed)), length(blood_traits1))
+metabo_bloodtrait_pval1 = matrix(NA,length(1:length(allsamples_norm_cl_trimmed)), length(blood_traits1))
+metabo_bloodtrait_n1 = matrix(NA,length(1:length(allsamples_norm_cl_trimmed)), length(blood_traits1))
+
+
+for (i in 1:length(blood_traits)) {
+
+  datTraits_trait <- datTraits_for_assoc[complete.cases(datTraits_for_assoc[,which(colnames(datTraits_for_assoc)==blood_traits[i])]),]
+  keeping_indiv <- rownames(datTraits_trait)
+  datTraits_trait$Zpheno <- invnorm(datTraits_trait[,which(names(datTraits_trait)==blood_traits[i])])
+  allsamples_norm_cl_trimmedTrait <- allsamples_norm_cl_trimmed[(rownames(allsamples_norm_cl_trimmed) %in% keeping_indiv),]
+
+  covariates <- strsplit(cov_names, split=",")[[1]]
+  cov=datTraits_trait[,covariates]
+
+  observed_pval <- sapply(allsamples_norm_cl_trimmedTrait, linearRegcov_p, y=datTraits_trait$Zpheno, data=cov)
+  std_err <- sapply(allsamples_norm_cl_trimmedTrait, linearRegcov_stderr, y=datTraits_trait$Zpheno, data=cov)
+  effect_size <- sapply(allsamples_norm_cl_trimmedTrait, linearRegcov_effect, y=datTraits_trait$Zpheno, data=cov)
+  sample_size <- sapply(allsamples_norm_cl_trimmedTrait, linearRegcov_samplesize, y=datTraits_trait$Zpheno, data=cov)
+
+  metabo_bloodtrait_pval [,i] <- observed_pval
+  metabo_bloodtrait_cor[,i] <- effect_size
+  metabo_bloodtrait_n[,i] <- sample_size
+}
+
+for (i in 1:length(blood_traits1)) { 
+  
+  datTraits_trait <- datTraits_for_assoc[complete.cases(datTraits_for_assoc[,which(colnames(datTraits_for_assoc)==blood_traits1[i])]),]
+  keeping_indiv <- rownames(datTraits_trait)
+  datTraits_trait$Zpheno <- invnorm(datTraits_trait[,which(names(datTraits_trait)==blood_traits1[i])])
+  allsamples_norm_cl_trimmedTrait <- allsamples_norm_cl_trimmed[(rownames(allsamples_norm_cl_trimmed) %in% keeping_indiv),]
+
+  covariates <- strsplit(cov_names1, split=",")[[1]]
+  cov=datTraits_trait[,covariates]
+
+  observed_pval <- sapply(allsamples_norm_cl_trimmedTrait, linearRegcov_p, y=datTraits_trait$Zpheno, data=cov)
+  std_err <- sapply(allsamples_norm_cl_trimmedTrait, linearRegcov_stderr, y=datTraits_trait$Zpheno, data=cov)
+  effect_size <- sapply(allsamples_norm_cl_trimmedTrait, linearRegcov_effect, y=datTraits_trait$Zpheno, data=cov)
+  sample_size <- sapply(allsamples_norm_cl_trimmedTrait, linearRegcov_samplesize, y=datTraits_trait$Zpheno, data=cov)
+
+  metabo_bloodtrait_pval1 [,i] <- observed_pval
+  metabo_bloodtrait_cor1[,i] <- effect_size
+  metabo_bloodtrait_n1[,i] <- sample_size
+}
+
+metabo_bloodtrait_cor <- cbind(metabo_bloodtrait_cor,metabo_bloodtrait_cor1)
+metabo_bloodtrait_cor_final <- as.data.frame(metabo_bloodtrait_cor)
+names(metabo_bloodtrait_cor_final) <- paste(c(blood_traits,"eGFR"),".beta",sep="")
+rownames(metabo_bloodtrait_cor_final) <- colnames(allsamples_norm_cl_trimmed)
+
+metabo_bloodtrait_pval <- cbind(metabo_bloodtrait_pval,metabo_bloodtrait_pval1)
+metabo_bloodtrait_pval_final <- as.data.frame(metabo_bloodtrait_pval)
+names(metabo_bloodtrait_pval_final) <- paste(c(blood_traits,"eGFR"),".pval",sep="")
+rownames(metabo_bloodtrait_pval_final) <- colnames(allsamples_norm_cl_trimmed)
+
+metabo_bloodtrait_n <- cbind(metabo_bloodtrait_n,metabo_bloodtrait_n1)
+metabo_bloodtrait_n_final <- as.data.frame(metabo_bloodtrait_n)
+names(metabo_bloodtrait_n_final) <- paste(c(blood_traits,"eGFR"),".N",sep="")
+rownames(metabo_bloodtrait_n_final) <- colnames(allsamples_norm_cl_trimmed)
+
+save(metabo_bloodtrait_n_final, metabo_bloodtrait_pval_final, metabo_bloodtrait_cor_final, file = "Module_Blood_Traits_Associations.RData")
+
+#Metabolites to complications
+metabo_complications_cor = matrix(NA,length(1:length(allsamples_norm_cl_trimmed)), length(complications))
+metabo_complications_pval = matrix(NA,length(1:length(allsamples_norm_cl_trimmed)), length(complications))
+metabo_complications_n = matrix(NA,length(1:length(allsamples_norm_cl_trimmed)), length(complications))
+
+
+for (i in 1:length(complications)) { 
+  
+  datTraits_trait <- datTraits_for_assoc[complete.cases(datTraits_for_assoc[,which(colnames(datTraits_for_assoc)==complications[i])]),]
+  keeping_indiv <- rownames(datTraits_trait)
+  datTraits_trait$Zpheno <- datTraits_trait[,which(names(datTraits_trait)==complications[i])]
+  allsamples_norm_cl_trimmedTrait <- allsamples_norm_cl_trimmed[(rownames(allsamples_norm_cl_trimmed) %in% keeping_indiv),]
+
+  covariates <- strsplit(cov_names, split=",")[[1]]
+  cov=datTraits_trait[,covariates]
+
+  observed_pval <- sapply(allsamples_norm_cl_trimmedTrait, logisticRegcov_p, y=datTraits_trait$Zpheno, data=cov)
+  effect_size <- sapply(allsamples_norm_cl_trimmedTrait, logisticRegcov_effect, y=datTraits_trait$Zpheno, data=cov)
+  sample_size <- sapply(allsamples_norm_cl_trimmedTrait, logisticRegcov_samplesize, y=datTraits_trait$Zpheno, data=cov)
+
+
+  metabo_complications_pval [,i] <- observed_pval
+  metabo_complications_cor[,i] <- effect_size
+  metabo_complications_n[,i] <- sample_size
+}
+
+metabo_complications_cor_final <- as.data.frame(metabo_complications_cor)
+names(metabo_complications_cor_final) <- paste(complications,".beta",sep="")
+rownames(metabo_complications_cor_final) <- colnames(allsamples_norm_cl_trimmed)
+
+metabo_complications_pval_final <- as.data.frame(metabo_complications_pval)
+names(metabo_complications_pval_final) <- paste(complications,".pval",sep="")
+rownames(metabo_complications_pval_final) <- colnames(allsamples_norm_cl_trimmed)
+
+metabo_complications_n_final <- as.data.frame(metabo_complications_n)
+names(metabo_complications_n_final) <- paste(complications,".N",sep="")
+rownames(metabo_complications_n_final) <- colnames(allsamples_norm_cl_trimmed)
+save(metabo_complications_n_final, metabo_complications_pval_final, metabo_complications_cor_final, file = "Module_Complications_Associations.RData")
+
+lcomp <- load("Module_Complications_Associations.RData")
+```
+
+## Annotate metabolites, and modules association results
+```{r,eval=FALSE}
+metabo_annotation <- fread("~/Desktop/Metabolite_All_Data_dec52017/wgcna_scd/data/full_list_from_analysis_annotated_FINAL.txt",sep="\t",h=F,stringsAsFactors = F)
+names(metabo_annotation) <- c("metabo_name",   "hmdb_id_input", "metabo_super_class","metabo_class","metabo_subclass",
+                              "metabo_biofunction","metabo_accession_secondary","metabo_disease","metabo_gene",
+                              "metabo_description")
+
+metabo_bloodtrait_pval_final$metabo_name <- rownames(metabo_bloodtrait_pval_final)
+metabo_complications_pval_final$metabo_name <- rownames(metabo_complications_pval_final)
+metabo_modulemembership_pval_final$metabo_name <- rownames(metabo_modulemembership_pval_final)
+
+metabo_bloodtrait_pval_final_annotation <- merge(metabo_bloodtrait_pval_final, metabo_annotation, by="metabo_name")
+metabo_complications_pval_final_annotation <- merge(metabo_complications_pval_final, metabo_annotation, by="metabo_name")
+metabo_modulemembership_pval_final_annotation <- merge(metabo_modulemembership_pval_final, metabo_annotation, by="metabo_name")
+
+metabo_bloodtrait_cor_final$metabo_name <- rownames(metabo_bloodtrait_cor_final)
+metabo_complications_cor_final$metabo_name <- rownames(metabo_complications_cor_final)
+metabo_modulemembership_cor_final$metabo_name <- rownames(metabo_modulemembership_cor_final)
+
+metabo_bloodtrait_cor_pval_final_annotation <- merge(metabo_bloodtrait_cor_final, metabo_bloodtrait_pval_final_annotation, by="metabo_name")
+metabo_complications_cor_pval_final_annotation <- merge(metabo_complications_cor_final, metabo_complications_pval_final_annotation, by="metabo_name")
+metabo_modulemembership_cor_pval_final_annotation <- merge(metabo_modulemembership_cor_final, metabo_modulemembership_pval_final_annotation, by="metabo_name")
+
+metabolite_group_order <- colnames(allsamples_norm_cl_trimmed)
+metabolite_color_match <- cbind(metabolite_group_order,moduleColors)
+
+
+#########
+metabo_modulemembership_cor_pval_final_annotation <- metabo_modulemembership_cor_pval_final_annotation[match(metabolite_color_match[,1], metabo_modulemembership_cor_pval_final_annotation$metabo_name),]
+metabo_bloodtrait_cor_pval_final_annotation <- metabo_bloodtrait_cor_pval_final_annotation[match(metabolite_color_match[,1], metabo_bloodtrait_cor_pval_final_annotation$metabo_name),]
+metabo_complications_cor_pval_final_annotation <- metabo_complications_cor_pval_final_annotation[match(metabolite_color_match[,1], metabo_complications_cor_pval_final_annotation$metabo_name),]
+
+
+# Create the starting data frame
+geneInfo0 = data.frame(
+  moduleColor = moduleColors,
+  metabo_bloodtrait_cor_pval_final_annotation)
+
+geneInfo1 = data.frame(
+  moduleColor = moduleColors,
+  metabo_complications_cor_pval_final_annotation)
+
+geneInfo2 = data.frame(
+  moduleColor = moduleColors,
+  metabo_modulemembership_cor_pval_final_annotation)
+
+save(metabo_modulemembership_cor_pval_final_annotation, metabo_bloodtrait_cor_pval_final_annotation,
+     metabo_complications_cor_pval_final_annotation, geneInfo0,geneInfo1,geneInfo2,file = "allsamples-03-associations_annotation_external_traits.RData")
+
+write.csv(geneInfo0, file = "metabo_bloodtrait_Info_FINAL2.csv",row.names = F)
+write.csv(geneInfo1, file = "metabo_complication_Info_FINAL2.csv",row.names = F)
+write.csv(geneInfo2, file = "metabo_module_Info_FINAL2.csv",row.names = F)
+```
+
+# Robustness Analysis
+## Robustness through network preservations analysis
+```{r,eval=FALSE}
+no.indivs = dim(allsamples_norm_cl_trimmed)[[1]]
+##Plotting results
+set.seed(1)
+pdf(file = "Robustness_dropping_samples.pdf", width = 12, height = 9)
+par(mfrow=c(8,2), mar=c(2,2,2,1))
+for (i in 1:8) {
+  subsetindivs=sample(1:no.indivs,344,replace=F)
+  robustness_drop_samples(metabolites_data = allsamples_norm_cl_trimmed[subsetindivs,],
+                          module_colors = moduleColors,power1=6 ,main1="SCD Metabolites Network",
+                          filename=paste("metabolites_clust_",i,".txt",sep=""))
+}
+dev.off()
+
+set.seed(1)
+
+for (i in 1:1) {
+  subsetindivs=sample(1:no.indivs,344,replace=F)
+  multiExpr = list(original = list(data = allsamples_norm_cl_trimmed), dropped_sample = list(data = allsamples_norm_cl_trimmed[subsetindivs,]))
+  multiColor = list(original = moduleColors)
+
+  system.time( {
+    mp = modulePreservation(multiExpr, multiColor,
+                          referenceNetworks = 1,
+                          networkType = "signed",
+                          nPermutations = 200,
+                          randomSeed = 1,
+                          quickCor = 0,
+                          verbose = 2)
+    } );
+
+  save(mp, file = paste("modulePreservation.RData",sep="",i));
+
+  ref = 1
+  test = 2
+  statsObs = cbind(mp$quality$observed[[ref]][[test]][, -1], mp$preservation$observed[[ref]][[test]][, -1])
+  statsZ = cbind(mp$quality$Z[[ref]][[test]][, -1], mp$preservation$Z[[ref]][[test]][, -1]);
+
+  assign(paste("preservations_stats",i,sep=""), as.data.frame(cbind(statsObs[, c("medianRank.pres", "medianRank.qual")],
+                                                                    signif(statsZ[, c("Zsummary.pres", "Zsummary.qual")], 2))))
+  }
+
+write.table(preservations_stats1 ,file= "preservations_stats1.txt",quote = FALSE, row.names = T, col.names = TRUE,sep="\t")
+write.table(preservations_stats2 ,file= "preservations_stats2.txt",quote = FALSE, row.names = T, col.names = TRUE,sep="\t")
+write.table(preservations_stats3 ,file= "preservations_stats3.txt",quote = FALSE, row.names = T, col.names = TRUE,sep="\t")
+write.table(preservations_stats4 ,file= "preservations_stats4.txt",quote = FALSE, row.names = T, col.names = TRUE,sep="\t")
+write.table(preservations_stats5 ,file= "preservations_stats5.txt",quote = FALSE, row.names = T, col.names = TRUE,sep="\t")
+write.table(preservations_stats6 ,file= "preservations_stats6.txt",quote = FALSE, row.names = T, col.names = TRUE,sep="\t")
+write.table(preservations_stats7 ,file= "preservations_stats7.txt",quote = FALSE, row.names = T, col.names = TRUE,sep="\t")
+write.table(preservations_stats8 ,file= "preservations_stats8.txt",quote = FALSE, row.names = T, col.names = TRUE,sep="\t")
+
+preservations_stats_all <- cbind(preservations_stats1$Zsummary.pres +preservations_stats2$Zsummary.pres +
+        preservations_stats3$Zsummary.pres +
+      preservations_stats4$Zsummary.pres +
+      preservations_stats5$Zsummary.pres +
+      preservations_stats6$Zsummary.pres +
+      preservations_stats7$Zsummary.pres +
+        preservations_stats8$Zsummary.pres)/8
+
+preservations_stats_all_df <- as.data.frame(cbind(rownames(preservations_stats1),preservations_stats_all))
+preservations_stats_all_df$V2 <- as.numeric(preservations_stats_all_df$V2)
+
+preserved_modules <- preservations_stats_all_df[preservations_stats_all_df$V2 > 10,]
+preserved_not_modules <- preservations_stats_all_df[preservations_stats_all_df$V2 < 10,]
+
+save(preservations_stats_all_df, file = "module_preservation_stats.RData")
+```
+
+## Robustness through module connectivity strength
+```{r,eval=F}
+png(file="TopModule_IntramodularStrength_Complications.png", units = "px",width=3000, height=2000, res=350, pointsize=9)
+scatterplots_metabo(module_color="lightcyan1",trait="Cholecystectomy.beta",metabolite_significance=metabo_complications_cor_final,
+                    module_membership_cor=metabo_modulemembership_cor_final,alt_color="blue")
+#scatterplots_metabo(module_color="coral1",trait="Legulcer.beta",dataset=metabo_complications_cor_final,alt_color="")
+dev.off()
+
+png(file="TopModule_IntramodularStrength_Blood_Hematocrit.png", units = "px",width=3000, height=2000, res=350, pointsize=9)
+par(mfrow=c(3,5))
+scatterplots_metabo(module_color="darkorange",trait="Hematocrit.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="yellow4",trait="Hematocrit.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="lightcyan",trait="Hematocrit.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="mediumorchid",trait="Hematocrit.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="firebrick4",trait="Hematocrit.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="maroon",trait="Hematocrit.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="darkgreen",trait="Hematocrit.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="darkslateblue",trait="Hematocrit.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="magenta",trait="Hematocrit.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="blue",trait="Hematocrit.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="brown4",trait="Hematocrit.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="skyblue1",trait="Hematocrit.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="darkgrey",trait="Hematocrit.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="lightcoral",trait="Hematocrit.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="sienna3",trait="Hematocrit.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+dev.off()
+
+png(file="TopModule_IntramodularStrength_Blood_HemoglobinF.png", units = "px",width=3000, height=2000, res=350, pointsize=9)
+scatterplots_metabo(module_color="darkslateblue",trait="HemoglobinF.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+dev.off()
+
+png(file="TopModule_IntramodularStrength_Blood_RBC.png", units = "px",width=3000, height=2000, res=350, pointsize=9)
+par(mfrow=c(3,4))
+scatterplots_metabo(module_color="darkorange",trait="RBC.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="yellow4",trait="RBC.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="lightcyan",trait="RBC.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="mediumorchid",trait="RBC.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="firebrick4",trait="RBC.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="darkolivegreen4",trait="RBC.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="maroon",trait="RBC.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="darkslateblue",trait="RBC.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="skyblue1",trait="RBC.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="darkgrey",trait="RBC.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="lightcoral",trait="RBC.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="sienna3",trait="RBC.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+dev.off()
+
+png(file="TopModule_IntramodularStrength_Blood_eGFR.png", units = "px",width=3000, height=2000, res=350, pointsize=9)
+par(mfrow=c(3,7))
+scatterplots_metabo(module_color="plum",trait="eGFR.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="greenyellow",trait="eGFR.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="honeydew1",trait="eGFR.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="skyblue3",trait="eGFR.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="darkorange",trait="eGFR.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="royalblue",trait="eGFR.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="lightcyan",trait="eGFR.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="blue")
+scatterplots_metabo(module_color="darkolivegreen4",trait="eGFR.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="cyan",trait="eGFR.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="grey60",trait="eGFR.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="maroon",trait="eGFR.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="darkgreen",trait="eGFR.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="darkslateblue",trait="eGFR.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="magenta",trait="eGFR.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="coral1",trait="eGFR.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="darkmagenta",trait="eGFR.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="blue",trait="eGFR.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="coral2",trait="eGFR.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="brown",trait="eGFR.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="plum2",trait="eGFR.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="grey",trait="eGFR.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+dev.off()
+
+png(file="TopModule_IntramodularStrength_Blood_MCH.png", units = "px",width=3000, height=2000, res=350, pointsize=9)
+scatterplots_metabo(module_color="lightcyan",trait="MCH.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="blue")
+dev.off()
+
+png(file="TopModule_IntramodularStrength_Blood_MCHC.png", units = "px",width=3000, height=2000, res=350, pointsize=9)
+par(mfrow=c(3,4))
+scatterplots_metabo(module_color="yellow4",trait="MCHC.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="lightcyan",trait="MCHC.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="blue")
+scatterplots_metabo(module_color="mediumorchid",trait="MCHC.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="lightsteelblue1",trait="MCHC.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="skyblue1",trait="MCHC.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="darkgrey",trait="MCHC.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+
+scatterplots_metabo(module_color="mediumpurple2",trait="MCHC.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="darkorange2",trait="MCHC.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="lightcoral",trait="MCHC.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="darkred",trait="MCHC.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="sienna3",trait="MCHC.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+dev.off()
+
+png(file="TopModule_IntramodularStrength_Blood_MCV.png", units = "px",width=3000, height=2000, res=350, pointsize=9)
+scatterplots_metabo(module_color="lightcyan",trait="MCV.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="blue")
+dev.off()
+
+png(file="TopModule_IntramodularStrength_Blood_Platelets.png", units = "px",width=3000, height=2000, res=350, pointsize=9)
+par(mfrow=c(2,3))
+scatterplots_metabo(module_color="darkorange2",trait="Platelets.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="skyblue",trait="Platelets.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="darkviolet",trait="Platelets.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+dev.off()
+
+png(file="TopModule_IntramodularStrength_Blood_Reticulocyte.png", units = "px",width=3000, height=2000, res=350, pointsize=9)
+par(mfrow=c(2,3))
+scatterplots_metabo(module_color="yellow4",trait="Reticulocyte.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="darkslateblue",trait="Reticulocyte.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="lightyellow",trait="Reticulocyte.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="yellow")
+dev.off()
+
+png(file="TopModule_IntramodularStrength_Blood_Whitebloodcount.png", units = "px",width=3000, height=2000, res=350, pointsize=9)
+par(mfrow=c(3,5))
+scatterplots_metabo(module_color="bisque4",trait="Whitebloodcount.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="royalblue",trait="Whitebloodcount.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="lightpink4",trait="Whitebloodcount.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="lightcyan",trait="Whitebloodcount.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="blue")
+scatterplots_metabo(module_color="mediumorchid",trait="Whitebloodcount.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="firebrick4",trait="Whitebloodcount.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="darkgreen",trait="Whitebloodcount.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="darkslateblue",trait="Whitebloodcount.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="darkviolet",trait="Whitebloodcount.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="skyblue1",trait="Whitebloodcount.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="darkorange2",trait="Whitebloodcount.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="lightcoral",trait="Whitebloodcount.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="antiquewhite4",trait="Whitebloodcount.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+scatterplots_metabo(module_color="skyblue",trait="Whitebloodcount.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+dev.off()
+
+png(file="TopModule_IntramodularStrength_Blood_Bilirubin.png", units = "px",width=3000, height=2000, res=350, pointsize=9)
+par(mfrow=c(2,2))
+scatterplots_metabo(module_color="yellow4",trait="Bilirubin.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+
+scatterplots_metabo(module_color="lightcyan",trait="Bilirubin.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+
+scatterplots_metabo(module_color="skyblue1",trait="Bilirubin.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="")
+dev.off()
+
+png(file="TopModule_IntramodularStrength_Blood_LDH.png", units = "px",width=3000, height=2000, res=350, pointsize=9)
+par(mfrow=c(1,2))
+scatterplots_metabo(module_color="lightcyan",trait="LDH.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="blue")
+
+scatterplots_metabo(module_color="steelblue",trait="LDH.beta",metabolite_significance=metabo_bloodtrait_cor_final, module_membership_cor=metabo_modulemembership_cor_final,alt_color="blue")
+dev.off()
+
+```
+
+<img src="https://github.com/yilboudo/WGCNA_SCD/blob/master/plots/TopModule_IntramodularStrength_Blood_Hematocrit.png?raw=true" alt="Drawing" style="width: 900px;"/>
+<img src="https://github.com/yilboudo/WGCNA_SCD/blob/master/plots/TopModule_IntramodularStrength_Blood_HemoglobinF.png?raw=true" alt="Drawing" style="width: 900px;"/>
+<img src="https://github.com/yilboudo/WGCNA_SCD/blob/master/plots/TopModule_IntramodularStrength_Blood_MCH.png?raw=true" alt="Drawing" style="width: 900px;"/>
+<img src="https://github.com/yilboudo/WGCNA_SCD/blob/master/plots/TopModule_IntramodularStrength_Blood_MCHC.png?raw=true" alt="Drawing" style="width: 900px;"/>
+<img src="https://github.com/yilboudo/WGCNA_SCD/blob/master/plots/TopModule_IntramodularStrength_Blood_LDH.png?raw=true" alt="Drawing" style="width: 900px;"/>
+<img src="https://github.com/yilboudo/WGCNA_SCD/blob/master/plots/TopModule_IntramodularStrength_Blood_Bilirubin.png?raw=true" alt="Drawing" style="width: 900px;"/>
+<img src="https://github.com/yilboudo/WGCNA_SCD/blob/master/plots/TopModule_IntramodularStrength_Blood_MCV.png?raw=true" alt="Drawing" style="width: 900px;"/>
+<img src="https://github.com/yilboudo/WGCNA_SCD/blob/master/plots/TopModule_IntramodularStrength_Blood_Platelets.png?raw=true" alt="Drawing" style="width: 900px;"/>
+<img src="https://github.com/yilboudo/WGCNA_SCD/blob/master/plots/TopModule_IntramodularStrength_Blood_RBC.png?raw=true" alt="Drawing" style="width: 900px;"/>
+<img src="https://github.com/yilboudo/WGCNA_SCD/blob/master/plots/TopModule_IntramodularStrength_Blood_Reticulocyte.png?raw=true" alt="Drawing" style="width: 900px;"/>
+<img src="https://github.com/yilboudo/WGCNA_SCD/blob/master/plots/TopModule_IntramodularStrength_Blood_Whitebloodcount.png?raw=true" alt="Drawing" style="width: 900px;"/>
+<img src="https://github.com/yilboudo/WGCNA_SCD/blob/master/plots/TopModule_IntramodularStrength_Blood_eGFR.png?raw=true" alt="Drawing" style="width: 900px;"/>
+<img src="https://github.com/yilboudo/WGCNA_SCD/blob/master/plots/TopModule_IntramodularStrength_Complications.png?raw=true" alt="Drawing" style="width: 900px;"/>
+
+
